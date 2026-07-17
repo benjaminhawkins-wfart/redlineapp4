@@ -7,6 +7,12 @@ import JSZip from "jszip";
 type Part = { value: string; kind: "same" | "added" | "removed" };
 type DisplayGroup = { kind: "same"; value: string } | { kind: "change"; removed: string; added: string };
 
+const MAX_FILE_BYTES = 10 * 1024 * 1024;
+const MAX_TEXT_CHARS = 2_000_000;
+const MAX_XML_CHARS = 5_000_000;
+const FILE_LIMIT_LABEL = "10 MB";
+const TEXT_LIMIT_LABEL = "2 million characters";
+
 const originalSample = `Payment shall be made within thirty (30) days of receipt of invoice. The Client may terminate this Agreement with 10 days written notice. All work product remains the property of the Consultant until payment is received.`;
 const revisedSample = `Payment shall be made within fifteen (15) business days of receipt of a valid invoice. The Client may terminate this Agreement with 30 days' written notice. All work product becomes the property of the Client upon full payment.`;
 
@@ -86,10 +92,15 @@ function mergeParts(parts: Part[]) {
 }
 
 async function extractTrackedChanges(file: File): Promise<Part[]> {
+  if (file.size > MAX_FILE_BYTES) throw new Error(`That file is larger than the ${FILE_LIMIT_LABEL} limit.`);
   const zip = await JSZip.loadAsync(await file.arrayBuffer());
   const documentFile = zip.file("word/document.xml");
   if (!documentFile) throw new Error("Missing Word document content");
-  const xml = new DOMParser().parseFromString(await documentFile.async("string"), "application/xml");
+  const uncompressedSize = (documentFile as unknown as { _data?: { uncompressedSize?: number } })._data?.uncompressedSize;
+  if (uncompressedSize && uncompressedSize > MAX_XML_CHARS) throw new Error("That Word document contains too much XML to process safely.");
+  const xmlText = await documentFile.async("string");
+  if (xmlText.length > MAX_XML_CHARS) throw new Error("That Word document contains too much XML to process safely.");
+  const xml = new DOMParser().parseFromString(xmlText, "application/xml");
   if (xml.querySelector("parsererror")) throw new Error("Invalid Word document");
   const parts: Part[] = [];
 
@@ -112,12 +123,12 @@ async function extractTrackedChanges(file: File): Promise<Part[]> {
   return mergeParts(parts);
 }
 
-function SourcePanel({ label, tone, value, fileName, onChange, onFile }: { label: string; tone: string; value: string; fileName: string; onChange: (v: string) => void; onFile: (f: File) => void }) {
+function SourcePanel({ label, tone, value, fileName, onChange, onFile, onLimit }: { label: string; tone: string; value: string; fileName: string; onChange: (v: string) => void; onFile: (f: File) => void; onLimit: () => void }) {
   const inputRef = useRef<HTMLInputElement>(null);
   return <section className="source-card">
     <div className="source-head"><div><span className={`dot ${tone}`} /> <strong>{label}</strong><p>{fileName || "Paste text or select a Word document"}</p></div><button className="file-btn" onClick={() => inputRef.current?.click()} aria-label={`Upload ${label} Word document`}><span>↑</span> Word file</button></div>
     <input ref={inputRef} hidden type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])} />
-    <textarea value={value} onChange={(e) => onChange(e.target.value)} placeholder={`Paste the ${label.toLowerCase()} text here…`} aria-label={`${label} text`} />
+    <textarea value={value} onChange={(e) => e.target.value.length <= MAX_TEXT_CHARS ? onChange(e.target.value) : onLimit()} placeholder={`Paste the ${label.toLowerCase()} text here…`} aria-label={`${label} text`} />
     <div className="source-foot"><span>{value.trim() ? value.trim().split(/\s+/).length : 0} words</span>{value && <button onClick={() => onChange("")}>Clear</button>}</div>
   </section>;
 }
@@ -142,10 +153,12 @@ export default function Home() {
   async function readDoc(file: File, side: "before" | "after") {
     try {
       setError("");
+      if (file.size > MAX_FILE_BYTES) throw new Error(`That file is larger than the ${FILE_LIMIT_LABEL} limit.`);
       const result = await mammoth.extractRawText({ arrayBuffer: await file.arrayBuffer() });
+      if (result.value.length > MAX_TEXT_CHARS) throw new Error(`The extracted text exceeds the ${TEXT_LIMIT_LABEL} limit.`);
       if (side === "before") { setBefore(result.value.trim()); setBeforeFile(file.name); }
       else { setAfter(result.value.trim()); setAfterFile(file.name); }
-    } catch { setError("That Word document couldn’t be read. Please try another .docx file or paste its text."); }
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "That Word document couldn’t be read. Please try another .docx file or paste its text."); }
   }
 
   async function copyMarkdown() {
@@ -158,9 +171,9 @@ export default function Home() {
       setError("");
       setConvertedParts(await extractTrackedChanges(file));
       setRedlineFile(file.name);
-    } catch {
+    } catch (cause) {
       setConvertedParts([]);
-      setError("That Word redline couldn’t be read. Please use a .docx file with Track Changes markup.");
+      setError(cause instanceof Error ? cause.message : "That Word redline couldn’t be read. Please use a .docx file with Track Changes markup.");
     }
   }
 
@@ -170,15 +183,16 @@ export default function Home() {
     <div className="workspace">
       <nav className="mode-tabs" aria-label="Redline tools"><button type="button" className={mode === "compare" ? "active" : ""} onClick={() => { setMode("compare"); setError(""); }}><span>01</span> Compare two versions</button><button type="button" className={mode === "convert" ? "active" : ""} onClick={() => { setMode("convert"); setError(""); }}><span>02</span> Convert Word redline</button></nav>
       {mode === "compare" ? <div className="sources">
-        <SourcePanel label="Original" tone="gray" value={before} fileName={beforeFile} onChange={setBefore} onFile={(f) => readDoc(f, "before")} />
+        <SourcePanel label="Original" tone="gray" value={before} fileName={beforeFile} onChange={setBefore} onFile={(f) => readDoc(f, "before")} onLimit={() => setError(`Pasted text is limited to ${TEXT_LIMIT_LABEL}.`)} />
         <div className="arrow" aria-hidden="true">→</div>
-        <SourcePanel label="Revised" tone="red" value={after} fileName={afterFile} onChange={setAfter} onFile={(f) => readDoc(f, "after")} />
+        <SourcePanel label="Revised" tone="red" value={after} fileName={afterFile} onChange={setAfter} onFile={(f) => readDoc(f, "after")} onLimit={() => setError(`Pasted text is limited to ${TEXT_LIMIT_LABEL}.`)} />
       </div> : <section className="converter-card">
         <div className="converter-copy"><span className="converter-step">WORD TRACK CHANGES → MARKDOWN</span><h2>Upload an existing redline</h2><p>Insertions become <code>**bold**</code>. Deletions become <code>~~strikethrough~~</code>. The file is processed privately in this browser.</p></div>
         <input ref={redlineInputRef} hidden type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={(e) => e.target.files?.[0] && readRedline(e.target.files[0])} />
         <button type="button" className={`redline-upload ${redlineFile ? "loaded" : ""}`} onClick={() => redlineInputRef.current?.click()}><span>{redlineFile ? "✓" : "↑"}</span><strong>{redlineFile || "Choose Word redline"}</strong><small>{redlineFile ? "Click to replace this document" : ".docx with Track Changes"}</small></button>
       </section>}
       {error && <div className="error" role="alert">{error}</div>}
+      <aside className="privacy-notice" aria-label="Privacy notice"><strong>Privacy notice</strong><span>Documents are processed locally in your browser and are not uploaded by this app. Do not use it on an untrusted device or with untrusted browser extensions. Copying results places document content on your clipboard. Files are limited to {FILE_LIMIT_LABEL}.</span></aside>
       <section className="result-card">
         <div className="result-head"><div><span className="result-kicker">{mode === "compare" ? "REDLINE" : "CONVERTED REDLINE"}</span><h2>{mode === "compare" ? "Comparison result" : "Markdown preview"}</h2></div><button className={`copy-btn ${copied ? "copied" : ""}`} onClick={copyMarkdown} disabled={!displayGroups.length}><span>{copied ? "✓" : "⧉"}</span>{copied ? "Copied" : "Copy Markdown"}</button></div>
         <div className="legend"><span className="markup-view">All Markup</span><span><i className="legend-add" /> Inserted</span><span><i className="legend-remove" /> Deleted</span><span className="stats"><b className="plus">+{additions}</b> insertions <b className="minus">−{removals}</b> deletions</span></div>
